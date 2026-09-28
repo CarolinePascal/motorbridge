@@ -28,7 +28,39 @@ pub trait CanBus: Send + Sync {
     fn shutdown(&self) -> Result<()>;
 }
 
+/// Channel prefix selecting the native PEAK uCAN backend, e.g. `pcanfd:can1@1000000`.
+pub const PCAN_USB_FD_PREFIX: &str = "pcanfd:";
+/// Setting this env var to `native` routes plain `canN` channels to the native
+/// PEAK uCAN backend on macOS/Windows (instead of PCBUSB / PCAN-Basic).
+pub const PCAN_BACKEND_ENV: &str = "MOTORBRIDGE_PCAN_BACKEND";
+
+/// Returns the channel spec for the native PEAK uCAN backend if selected.
+fn native_pcan_channel(channel: &str) -> Option<&str> {
+    if let Some(rest) = channel.strip_prefix(PCAN_USB_FD_PREFIX) {
+        return Some(rest);
+    }
+    let native = std::env::var(PCAN_BACKEND_ENV)
+        .map(|v| v.eq_ignore_ascii_case("native"))
+        .unwrap_or(false);
+    (native && cfg!(any(target_os = "windows", target_os = "macos"))).then_some(channel)
+}
+
 pub fn open_can_bus(channel: &str) -> Result<Arc<dyn CanBus>> {
+    if let Some(spec) = native_pcan_channel(channel) {
+        #[cfg(feature = "pcan-usb-fd")]
+        {
+            let bus: Arc<dyn CanBus> = Arc::new(crate::pcan_usb_fd::PcanUsbFdBus::open(spec)?);
+            return Ok(bus);
+        }
+        #[cfg(not(feature = "pcan-usb-fd"))]
+        {
+            let _ = spec;
+            return Err(crate::error::MotorError::Unsupported(
+                "native PEAK uCAN backend not compiled in (enable motor_core feature `pcan-usb-fd`)"
+                    .to_string(),
+            ));
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         let bus: Arc<dyn CanBus> = Arc::new(SocketCanBus::open(channel)?);
