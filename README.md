@@ -619,6 +619,25 @@ Replace `motor-id` and `feedback-id` with your scan hits.
 - `hits=0` on scan:
   - Check wiring, power, termination resistor, and CAN bitrate.
 
+### 11. Optional: native backend (all channels, no PCBUSB)
+
+PCBUSB only reaches the first channel of multi-channel adapters (e.g. PCAN-USB Pro FD: `can1` fails with `PCAN_ERROR_ILLHW`).
+The optional `pcan-usb-fd` feature talks to PEAK uCAN adapters (PCAN-USB FD / Pro FD / X6) directly over libusb, so `can0` and `can1` reach both ports. Classic CAN only.
+
+```bash
+# build with the native backend
+cargo build --release -p motor_cli -p motor_abi --features motor_core/pcan-usb-fd
+
+# CLI: select it with the `pcanfd:` prefix
+./target/release/motor_cli \
+  --vendor damiao --channel pcanfd:can1@1000000 --mode scan --start-id 1 --end-id 16
+
+# Python SDK (Python >= 3.10): editable install picks up target/release/libmotor_abi.dylib
+pip install -e bindings/python
+```
+
+In Python, use `Controller("pcanfd:can1")`, or set `MOTORBRIDGE_PCAN_BACKEND=native` (e.g. `os.environ["MOTORBRIDGE_PCAN_BACKEND"] = "native"` before creating controllers) to route plain `can0` / `can1` to the native backend.
+
 
 ## Linux CANable candleLight / gs_usb Quick Guide
 
