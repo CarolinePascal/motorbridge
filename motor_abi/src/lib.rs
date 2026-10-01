@@ -99,6 +99,10 @@ enum ControllerInner {
     // routes through `open_transport` with the vendor's own classic-vs-FD
     // `Transport`, so the driver lives in core's one `open_transport`.
     Unbound(String),
+    // Same lazy SocketCAN-family path, but created by `new_socketcanfd`: the
+    // CAN FD transport is used whatever the vendor's classic default, so a
+    // CAN-FD-configured bus (e.g. Damiao motors with use_can_fd) is honoured.
+    UnboundFd(String),
     // mcu-serial path — a vendor-agnostic UART-to-CAN MCU bridge, a sibling of
     // socketcan: store the port spec, open McuSerialBus lazily on first
     // `add_*_motor`. Classic 8-byte CAN only (no CAN-FD → hexfellow unsupported).
@@ -208,7 +212,7 @@ fn controller_vendor_name(inner: &ControllerInner) -> &'static str {
         ControllerInner::MyActuator(_) => "MyActuator",
         ControllerInner::Robstride(_) => "RobStride",
         ControllerInner::Hightorque(_) => "HighTorque",
-        ControllerInner::Unbound(_) => "Unbound",
+        ControllerInner::Unbound(_) | ControllerInner::UnboundFd(_) => "Unbound",
         ControllerInner::UnboundMcuSerial { .. } => "Unbound",
     }
 }
@@ -245,10 +249,24 @@ macro_rules! ensure_controller {
                         .map(<$ty>::new)
                         .map_err(|e| e.to_string())?,
                 );
+            } else if let ControllerInner::UnboundFd(channel) = inner {
+                // Explicit CAN FD request: honour it for every vendor.
+                let p = motor_core::bus::TransportParams {
+                    channel,
+                    serial_port: "",
+                    serial_baud: 0,
+                };
+                *inner = ControllerInner::$variant(
+                    motor_core::bus::open_transport(motor_core::bus::Transport::SocketCanFd, &p)
+                        .map(<$ty>::new)
+                        .map_err(|e| e.to_string())?,
+                );
             }
             match inner {
                 ControllerInner::$variant(ctrl) => Ok(ctrl),
-                ControllerInner::Unbound(_) | ControllerInner::UnboundMcuSerial { .. } => {
+                ControllerInner::Unbound(_)
+                | ControllerInner::UnboundFd(_)
+                | ControllerInner::UnboundMcuSerial { .. } => {
                     Err("controller binding failed".to_string())
                 }
                 current => Err(format!(

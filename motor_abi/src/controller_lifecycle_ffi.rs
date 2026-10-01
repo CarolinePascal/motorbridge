@@ -8,7 +8,7 @@ macro_rules! dispatch_controller {
             ControllerInner::MyActuator(ctrl) => ctrl.$method().map_err(|e| e.to_string()),
             ControllerInner::Robstride(ctrl) => ctrl.$method().map_err(|e| e.to_string()),
             ControllerInner::Hightorque(ctrl) => ctrl.$method().map_err(|e| e.to_string()),
-            ControllerInner::Unbound(_) => Err(
+            ControllerInner::Unbound(_) | ControllerInner::UnboundFd(_) => Err(
                 "controller has no motor; add a motor before calling this operation".to_string(),
             ),
             ControllerInner::UnboundMcuSerial { .. } => Err(
@@ -58,7 +58,7 @@ pub extern "C" fn motor_controller_new_socketcanfd(channel: *const c_char) -> *m
         }
     };
     Box::into_raw(Box::new(MotorController {
-        inner: Mutex::new(ControllerInner::Unbound(channel)),
+        inner: Mutex::new(ControllerInner::UnboundFd(channel)),
     }))
 }
 #[unsafe(no_mangle)]
