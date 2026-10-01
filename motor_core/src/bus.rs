@@ -88,17 +88,38 @@ pub fn open_socketcan(channel: &str) -> Result<Arc<dyn CanBus>> {
     open_can_bus(channel)
 }
 
+/// CAN FD transport. Linux: SocketCAN FD. macOS/Windows with the
+/// `pcan-usb-fd` feature: the native PEAK uCAN backend in CAN FD mode (default
+/// 1 Mbit/s nominal / 5 Mbit/s data; `can0@1000000/5000000` to override), so
+/// callers like `Controller.from_socketcanfd("can0")` work unchanged.
 pub fn open_socketcanfd(channel: &str) -> Result<Arc<dyn CanBus>> {
     #[cfg(target_os = "linux")]
     {
+        if let Some(spec) = channel.strip_prefix(PCAN_USB_FD_PREFIX) {
+            return open_native_pcan_fd(spec);
+        }
         let bus: Arc<dyn CanBus> = Arc::new(SocketCanFdBus::open(channel)?);
         Ok(bus)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = channel;
+        open_native_pcan_fd(channel.strip_prefix(PCAN_USB_FD_PREFIX).unwrap_or(channel))
+    }
+}
+
+fn open_native_pcan_fd(spec: &str) -> Result<Arc<dyn CanBus>> {
+    #[cfg(feature = "pcan-usb-fd")]
+    {
+        let bus: Arc<dyn CanBus> = Arc::new(crate::pcan_usb_fd::PcanUsbFdBus::open_fd(spec)?);
+        Ok(bus)
+    }
+    #[cfg(not(feature = "pcan-usb-fd"))]
+    {
+        let _ = spec;
         Err(crate::error::MotorError::InvalidArgument(
-            "socketcanfd transport is only available on Linux".to_string(),
+            "socketcanfd transport needs Linux, or the native PEAK uCAN backend \
+             (build with motor_core feature `pcan-usb-fd`)"
+                .to_string(),
         ))
     }
 }

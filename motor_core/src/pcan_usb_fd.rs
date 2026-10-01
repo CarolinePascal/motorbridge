@@ -10,9 +10,16 @@
 //! `drivers/net/can/usb/peak_usb/pcan_usb_fd.c` (used as documentation only;
 //! this is an independent implementation).
 //!
-//! Channel strings accepted by [`PcanUsbFdBus::open`]: `can0`, `can1@500000`,
-//! `0`, `1@1000000`. Classic CAN only (the `CanBus` trait carries 8-byte
-//! frames); default bitrate is 1 Mbit/s.
+//! Channel strings: `can0`, `can1@500000`, `0`, `1@1000000`, and for CAN FD
+//! `can0@1000000/5000000` (nominal/data bitrate). Default nominal bitrate is
+//! 1 Mbit/s; [`PcanUsbFdBus::open_fd`] defaults the data bitrate to 5 Mbit/s.
+//! The `CanBus` trait carries 8-byte frames, so CAN FD frames are limited to
+//! 8 data bytes (enough for e.g. Damiao motors in CAN FD mode).
+//!
+//! Bit timing uses a 75 % nominal sample point (the Linux default at 1 Mbit/s).
+//! This matters for CAN FD: with 80 %, a receiver switches to the data bitrate
+//! ~50 ns later than a 75 % transmitter, which lost most 5 Mbit/s replies from
+//! an 8-motor Damiao bus.
 #![cfg(feature = "pcan-usb-fd")]
 
 use crate::bus::{CanBus, CanFrame};
@@ -46,6 +53,7 @@ const FCT_DRVLD: u16 = 5;
 const CMD_RESET_MODE: u16 = 0x001;
 const CMD_NORMAL_MODE: u16 = 0x002;
 const CMD_TIMING_SLOW: u16 = 0x004;
+const CMD_TIMING_FAST: u16 = 0x005;
 const CMD_FILTER_STD: u16 = 0x008;
 const CMD_WR_ERR_CNT: u16 = 0x00a;
 const CMD_SET_EN_OPTION: u16 = 0x00b;
@@ -63,11 +71,17 @@ const FLAG_RTR: u16 = 0x01;
 const FLAG_EXT_ID: u16 = 0x02;
 const FLAG_LOOPED_BACK: u16 = 0x04;
 const FLAG_EXT_DATA_LEN: u16 = 0x10;
+const FLAG_BRS: u16 = 0x20;
 const STATUS_BUSOFF: u8 = 0x80;
 
 const USB_TIMEOUT: Duration = Duration::from_millis(1000);
 const RX_POLL: Duration = Duration::from_millis(100);
 const RX_QUEUE_LIMIT: usize = 4096;
+const DEFAULT_DATA_BITRATE: u32 = 5_000_000;
+const SAMPLE_POINT: f64 = 0.75;
+/// Set to 0/false/off to send CAN FD frames without bit-rate switch
+/// (same variable as the Linux SocketCAN FD backend; default here: on).
+const BRS_ENV: &str = "MOTOR_SOCKETCANFD_BRS";
 
 /// CAN bit timing in time quanta of the 80 MHz adapter clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,8 +93,17 @@ pub struct BitTiming {
 }
 
 impl BitTiming {
-    /// Smallest prescaler giving an exact bitrate with a sample point near 80 %.
+    /// Nominal (arbitration) bit timing: smallest exact prescaler, 75 % sample point.
     pub fn for_bitrate(bitrate: u32) -> Result<Self> {
+        Self::search(bitrate, 256, 128)
+    }
+
+    /// CAN FD data-phase bit timing (narrower register fields), 75 % sample point.
+    pub fn for_data_bitrate(bitrate: u32) -> Result<Self> {
+        Self::search(bitrate, 32, 16)
+    }
+
+    fn search(bitrate: u32, max_tseg1: u32, max_tseg2: u32) -> Result<Self> {
         if bitrate == 0 {
             return Err(MotorError::InvalidArgument("bitrate must be > 0".into()));
         }
@@ -89,9 +112,9 @@ impl BitTiming {
                 continue;
             }
             let ntq = CLOCK_HZ / (brp * bitrate);
-            let tseg1 = ((ntq as f64) * 0.8).round() as u32 - 1;
+            let tseg1 = ((ntq as f64) * SAMPLE_POINT).round() as u32 - 1;
             let tseg2 = ntq - 1 - tseg1;
-            if (1..=256).contains(&tseg1) && (1..=128).contains(&tseg2) {
+            if (1..=max_tseg1).contains(&tseg1) && (1..=max_tseg2).contains(&tseg2) {
                 return Ok(Self {
                     brp: brp as u16,
                     tseg1: tseg1 as u16,
@@ -134,6 +157,22 @@ fn cmd_timing_slow(channel: u8, bt: BitTiming) -> [u8; 8] {
     )
 }
 
+fn cmd_timing_fast(channel: u8, bt: BitTiming) -> [u8; 8] {
+    let brp = ((bt.brp - 1) & 0x3ff).to_le_bytes();
+    cmd(
+        channel,
+        CMD_TIMING_FAST,
+        &[
+            0,
+            ((bt.sjw - 1) & 0xf) as u8,
+            ((bt.tseg2 - 1) & 0xf) as u8,
+            ((bt.tseg1 - 1) & 0x1f) as u8,
+            brp[0],
+            brp[1],
+        ],
+    )
+}
+
 fn cmd_options(channel: u8, enable: bool, ucan_mask: u16, usb_mask: u16) -> [u8; 8] {
     let op = if enable {
         CMD_SET_EN_OPTION
@@ -150,9 +189,9 @@ fn cmd_reset_err_counters(channel: u8) -> [u8; 8] {
     cmd(channel, CMD_WR_ERR_CNT, &[0x00, 0xc0, 0, 0])
 }
 
-/// Encode one classic CAN frame as a uCAN TX record, followed by the
-/// 4-byte null terminator the firmware expects.
-pub fn encode_tx(channel: u8, frame: &CanFrame) -> Result<Vec<u8>> {
+/// Encode one frame (classic, or CAN FD with up to 8 bytes) as a uCAN TX
+/// record, followed by the 4-byte null terminator the firmware expects.
+pub fn encode_tx(channel: u8, frame: &CanFrame, fd: bool, brs: bool) -> Result<Vec<u8>> {
     if frame.dlc > 8 {
         return Err(MotorError::InvalidArgument(format!(
             "invalid DLC {}, expected <= 8",
@@ -161,11 +200,17 @@ pub fn encode_tx(channel: u8, frame: &CanFrame) -> Result<Vec<u8>> {
     }
     let len = usize::from(frame.dlc);
     let size = (20 + len + 3) & !3;
-    let (flags, id) = if frame.is_extended {
+    let (mut flags, id) = if frame.is_extended {
         (FLAG_EXT_ID, frame.arbitration_id & 0x1fff_ffff)
     } else {
         (0, frame.arbitration_id & 0x7ff)
     };
+    if fd {
+        flags |= FLAG_EXT_DATA_LEN; // DLC 0..8 encodes the same length in CAN FD
+        if brs {
+            flags |= FLAG_BRS;
+        }
+    }
     let mut out = Vec::with_capacity(size + 4);
     out.extend_from_slice(&(size as u16).to_le_bytes());
     out.extend_from_slice(&MSG_CAN_TX.to_le_bytes());
@@ -236,16 +281,20 @@ pub fn decode_rx(buf: &[u8]) -> Vec<RxEvent> {
     events
 }
 
-/// Parse `can1@500000`, `1`, `can0` into (channel index, bitrate).
-pub fn parse_channel(spec: &str) -> Result<(u8, u32)> {
-    let (name, bitrate) = match spec.split_once('@') {
-        Some((n, b)) => (
-            n,
-            b.parse::<u32>().map_err(|e| {
-                MotorError::InvalidArgument(format!("invalid bitrate in channel '{spec}': {e}"))
-            })?,
-        ),
-        None => (spec, 1_000_000),
+/// Parse `can1@500000`, `1`, `can0`, `can0@1000000/5000000` into
+/// (channel index, nominal bitrate, optional CAN FD data bitrate).
+pub fn parse_channel(spec: &str) -> Result<(u8, u32, Option<u32>)> {
+    let parse = |s: &str| {
+        s.parse::<u32>().map_err(|e| {
+            MotorError::InvalidArgument(format!("invalid bitrate in channel '{spec}': {e}"))
+        })
+    };
+    let (name, bitrate, data_bitrate) = match spec.split_once('@') {
+        Some((n, rates)) => match rates.split_once('/') {
+            Some((b, d)) => (n, parse(b)?, Some(parse(d)?)),
+            None => (n, parse(rates)?, None),
+        },
+        None => (spec, 1_000_000, None),
     };
     let lower = name.trim().to_ascii_lowercase();
     let idx = lower.strip_prefix("can").unwrap_or(&lower);
@@ -259,7 +308,7 @@ pub fn parse_channel(spec: &str) -> Result<(u8, u32)> {
             "channel index {channel} out of range (0..{MAX_CHANNELS})"
         )));
     }
-    Ok((channel, bitrate))
+    Ok((channel, bitrate, data_bitrate))
 }
 
 fn usb_err(ctx: &str, e: rusb::Error) -> MotorError {
@@ -393,12 +442,21 @@ impl Device {
         Ok(())
     }
 
-    fn start_channel(&self, channel: u8, bt: BitTiming, first: bool) -> Result<()> {
+    fn start_channel(
+        &self,
+        channel: u8,
+        bt: BitTiming,
+        dbt: Option<BitTiming>,
+        first: bool,
+    ) -> Result<()> {
         let mut setup = vec![
             cmd(channel, CMD_RESET_MODE, &[]),
             cmd(channel, CMD_CLK_SET, &[0]), // 80 MHz
             cmd_timing_slow(channel, bt),
         ];
+        if let Some(dbt) = dbt {
+            setup.push(cmd_timing_fast(channel, dbt));
+        }
         for row in 0u16..64 {
             let mut p = [0u8; 6];
             p[..2].copy_from_slice(&row.to_le_bytes());
@@ -492,13 +550,45 @@ fn rx_loop(dev: Weak<Device>) {
 pub struct PcanUsbFdBus {
     dev: Arc<Device>,
     channel: u8,
+    fd: bool,
+    brs: bool,
     active: AtomicBool,
 }
 
+fn brs_from_env() -> bool {
+    std::env::var(BRS_ENV)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
 impl PcanUsbFdBus {
+    /// Classic CAN, or CAN FD if the spec carries a data bitrate (`can0@1000000/5000000`).
     pub fn open(spec: &str) -> Result<Self> {
-        let (channel, bitrate) = parse_channel(spec)?;
+        let (_, _, data) = parse_channel(spec)?;
+        Self::open_with(spec, data.is_some())
+    }
+
+    /// CAN FD (data bitrate from the spec, default 5 Mbit/s). FD frames are sent
+    /// with bit-rate switch unless `MOTOR_SOCKETCANFD_BRS=0`.
+    pub fn open_fd(spec: &str) -> Result<Self> {
+        Self::open_with(spec, true)
+    }
+
+    fn open_with(spec: &str, fd: bool) -> Result<Self> {
+        let (channel, bitrate, data_bitrate) = parse_channel(spec)?;
         let bt = BitTiming::for_bitrate(bitrate)?;
+        let dbt = if fd {
+            Some(BitTiming::for_data_bitrate(
+                data_bitrate.unwrap_or(DEFAULT_DATA_BITRATE),
+            )?)
+        } else {
+            None
+        };
         let dev = Device::get_or_open()?;
         if channel >= dev.channel_count {
             return Err(MotorError::InvalidArgument(format!(
@@ -518,7 +608,7 @@ impl PcanUsbFdBus {
             s.open = true;
             s.queue.clear();
         }
-        if let Err(e) = dev.start_channel(channel, bt, first) {
+        if let Err(e) = dev.start_channel(channel, bt, dbt, first) {
             dev.channels[usize::from(channel)]
                 .0
                 .lock()
@@ -529,6 +619,8 @@ impl PcanUsbFdBus {
         Ok(Self {
             dev,
             channel,
+            fd,
+            brs: fd && brs_from_env(),
             active: AtomicBool::new(true),
         })
     }
@@ -539,7 +631,7 @@ impl CanBus for PcanUsbFdBus {
         if !self.active.load(Ordering::SeqCst) {
             return Err(MotorError::Io("pcan-usb-fd bus is already closed".into()));
         }
-        let pkt = encode_tx(self.channel, &frame)?;
+        let pkt = encode_tx(self.channel, &frame, self.fd, self.brs)?;
         self.dev
             .handle
             .write_bulk(
@@ -609,9 +701,19 @@ mod tests {
             bt,
             BitTiming {
                 brp: 1,
-                tseg1: 63,
-                tseg2: 16,
+                tseg1: 59,
+                tseg2: 20,
                 sjw: 16
+            }
+        ); // 75 % sample point
+        let dbt = BitTiming::for_data_bitrate(5_000_000).unwrap();
+        assert_eq!(
+            dbt,
+            BitTiming {
+                brp: 1,
+                tseg1: 11,
+                tseg2: 4,
+                sjw: 4
             }
         );
         for br in [500_000, 250_000, 125_000, 800_000, 50_000] {
@@ -625,7 +727,10 @@ mod tests {
     fn timing_slow_record_layout() {
         let bt = BitTiming::for_bitrate(1_000_000).unwrap();
         // opcode 0x004 on channel 1 -> 0x1004 LE; ewl, sjw-1, tseg2-1, tseg1-1, brp-1 LE
-        assert_eq!(cmd_timing_slow(1, bt), [0x04, 0x10, 96, 15, 15, 62, 0, 0]);
+        assert_eq!(cmd_timing_slow(1, bt), [0x04, 0x10, 96, 15, 19, 58, 0, 0]);
+        let dbt = BitTiming::for_data_bitrate(5_000_000).unwrap();
+        // opcode 0x005 on channel 0; unused, sjw-1, tseg2-1, tseg1-1, brp-1 LE
+        assert_eq!(cmd_timing_fast(0, dbt), [0x05, 0x00, 0, 3, 3, 10, 0, 0]);
     }
 
     #[test]
@@ -637,8 +742,14 @@ mod tests {
             is_extended: false,
             is_rx: false,
         };
-        let pkt = encode_tx(1, &frame).unwrap();
+        let pkt = encode_tx(1, &frame, false, false).unwrap();
         assert_eq!(pkt.len(), 28 + 4);
+        assert_eq!(&pkt[14..16], &[0, 0]); // classic: no flags
+        let fd = encode_tx(1, &frame, true, true).unwrap();
+        assert_eq!(&fd[14..16], &(FLAG_EXT_DATA_LEN | FLAG_BRS).to_le_bytes());
+        assert_eq!(fd[12], 0x81); // same DLC code for 8 bytes
+        let fd_nobrs = encode_tx(1, &frame, true, false).unwrap();
+        assert_eq!(&fd_nobrs[14..16], &FLAG_EXT_DATA_LEN.to_le_bytes());
         assert_eq!(&pkt[..4], &[28, 0, 0x00, 0x10]);
         assert_eq!(pkt[12], 0x81); // channel 1, dlc 8
         assert_eq!(&pkt[16..20], &0x7ffu32.to_le_bytes());
@@ -690,9 +801,14 @@ mod tests {
 
     #[test]
     fn parse_channel_forms() {
-        assert_eq!(parse_channel("can0").unwrap(), (0, 1_000_000));
-        assert_eq!(parse_channel("can1@500000").unwrap(), (1, 500_000));
-        assert_eq!(parse_channel("1").unwrap(), (1, 1_000_000));
+        assert_eq!(parse_channel("can0").unwrap(), (0, 1_000_000, None));
+        assert_eq!(parse_channel("can1@500000").unwrap(), (1, 500_000, None));
+        assert_eq!(parse_channel("1").unwrap(), (1, 1_000_000, None));
+        assert_eq!(
+            parse_channel("can1@1000000/5000000").unwrap(),
+            (1, 1_000_000, Some(5_000_000))
+        );
+        assert!(parse_channel("can0@1000000/x").is_err());
         assert!(parse_channel("can2").is_err());
         assert!(parse_channel("canX").is_err());
         assert!(parse_channel("can0@fast").is_err());
