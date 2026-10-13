@@ -10,8 +10,9 @@
 //! `drivers/net/can/usb/peak_usb/pcan_usb_fd.c` (used as documentation only;
 //! this is an independent implementation).
 //!
-//! Channel strings: `can0`, `can1@500000`, `0`, `1@1000000`, and for CAN FD
-//! `can0@1000000/5000000` (nominal/data bitrate). Default nominal bitrate is
+//! Selected with the `peakusb:` channel prefix (see `bus::open_can_bus`).
+//! Channel strings after the prefix: `can0`, `can1@500000`, `0`, `1@1000000`,
+//! and for CAN FD `can0@1000000/5000000` (nominal/data bitrate). Default nominal bitrate is
 //! 1 Mbit/s; [`PcanUsbFdBus::open_fd`] defaults the data bitrate to 5 Mbit/s.
 //! The `CanBus` trait carries 8-byte frames, so CAN FD frames are limited to
 //! 8 data bytes (enough for e.g. Damiao motors in CAN FD mode).
@@ -20,7 +21,6 @@
 //! This matters for CAN FD: with 80 %, a receiver switches to the data bitrate
 //! ~50 ns later than a 75 % transmitter, which lost most 5 Mbit/s replies from
 //! an 8-motor Damiao bus.
-#![cfg(feature = "pcan-usb-fd")]
 
 use crate::bus::{CanBus, CanFrame};
 use crate::error::{MotorError, Result};
@@ -77,6 +77,7 @@ const STATUS_BUSOFF: u8 = 0x80;
 const USB_TIMEOUT: Duration = Duration::from_millis(1000);
 const RX_POLL: Duration = Duration::from_millis(100);
 const RX_QUEUE_LIMIT: usize = 4096;
+const RECONNECT_BACKOFF_MS: [u64; 3] = [20, 100, 300];
 const DEFAULT_DATA_BITRATE: u32 = 5_000_000;
 const SAMPLE_POINT: f64 = 0.75;
 /// Set to 0/false/off to send CAN FD frames without bit-rate switch
@@ -539,7 +540,13 @@ fn rx_loop(dev: Weak<Device>) {
                 }
             }
             Err(rusb::Error::Timeout) => {}
-            Err(rusb::Error::NoDevice) => return,
+            Err(rusb::Error::NoDevice) => {
+                d.running.store(false, Ordering::SeqCst);
+                for (_, cv) in &d.channels {
+                    cv.notify_all();
+                }
+                return;
+            }
             Err(_) => thread::sleep(Duration::from_millis(10)),
         }
         // drop the strong ref before the next blocking read
@@ -550,6 +557,8 @@ fn rx_loop(dev: Weak<Device>) {
 pub struct PcanUsbFdBus {
     dev: Arc<Device>,
     channel: u8,
+    bt: BitTiming,
+    dbt: Option<BitTiming>,
     fd: bool,
     brs: bool,
     active: AtomicBool,
@@ -619,10 +628,33 @@ impl PcanUsbFdBus {
         Ok(Self {
             dev,
             channel,
+            bt,
+            dbt,
             fd,
             brs: fd && brs_from_env(),
             active: AtomicBool::new(true),
         })
+    }
+
+    /// Re-initialise this channel (reset, bit timing, normal mode) with backoff.
+    /// An unplugged adapter cannot be recovered here: reopen the bus instead.
+    fn reconnect(&self) -> Result<()> {
+        for backoff in RECONNECT_BACKOFF_MS {
+            if self.dev.running.load(Ordering::SeqCst)
+                && self
+                    .dev
+                    .start_channel(self.channel, self.bt, self.dbt, false)
+                    .is_ok()
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(backoff));
+        }
+        Err(MotorError::Io(format!(
+            "pcan-usb-fd can{} reconnect failed after {} attempts",
+            self.channel,
+            RECONNECT_BACKOFF_MS.len()
+        )))
     }
 }
 
@@ -632,15 +664,19 @@ impl CanBus for PcanUsbFdBus {
             return Err(MotorError::Io("pcan-usb-fd bus is already closed".into()));
         }
         let pkt = encode_tx(self.channel, &frame, self.fd, self.brs)?;
-        self.dev
-            .handle
-            .write_bulk(
-                self.dev.ep_data_out[usize::from(self.channel)],
-                &pkt,
-                USB_TIMEOUT,
-            )
-            .map_err(|e| usb_err("send frame", e))?;
-        Ok(())
+        let ep = self.dev.ep_data_out[usize::from(self.channel)];
+        let mut last_err = None;
+        for _ in 0..=RECONNECT_BACKOFF_MS.len() {
+            match self.dev.handle.write_bulk(ep, &pkt, USB_TIMEOUT) {
+                Ok(_) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+            self.reconnect()?;
+        }
+        Err(usb_err(
+            "send frame after reconnect retries",
+            last_err.unwrap_or(rusb::Error::Other),
+        ))
     }
 
     fn recv(&self, timeout: Duration) -> Result<Option<CanFrame>> {
@@ -653,6 +689,9 @@ impl CanBus for PcanUsbFdBus {
         loop {
             if let Some(f) = s.queue.pop_front() {
                 return Ok(Some(f));
+            }
+            if !self.dev.running.load(Ordering::SeqCst) {
+                return Err(MotorError::Io("pcan-usb-fd adapter disconnected".into()));
             }
             let remaining = match deadline {
                 Some(d) => d.saturating_duration_since(Instant::now()),

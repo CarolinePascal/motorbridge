@@ -28,38 +28,33 @@ pub trait CanBus: Send + Sync {
     fn shutdown(&self) -> Result<()>;
 }
 
-/// Channel prefix selecting the native PEAK uCAN backend, e.g. `pcanfd:can1@1000000`.
-pub const PCAN_USB_FD_PREFIX: &str = "pcanfd:";
-/// Setting this env var to `native` routes plain `canN` channels to the native
-/// PEAK uCAN backend on macOS/Windows (instead of PCBUSB / PCAN-Basic).
-pub const PCAN_BACKEND_ENV: &str = "MOTORBRIDGE_PCAN_BACKEND";
+/// Prefix that selects the native libusb driver for PEAK uCAN adapters
+/// (PCAN-USB FD / Pro FD / X6), e.g. `peakusb:can1@1000000`, or
+/// `peakusb:can0@1000000/5000000` for CAN FD.
+pub const PEAKUSB_PREFIX: &str = "peakusb:";
 
-/// Returns the channel spec for the native PEAK uCAN backend if selected.
-fn native_pcan_channel(channel: &str) -> Option<&str> {
-    if let Some(rest) = channel.strip_prefix(PCAN_USB_FD_PREFIX) {
-        return Some(rest);
+fn open_peakusb(spec: &str, fd: bool) -> Result<Arc<dyn CanBus>> {
+    #[cfg(feature = "pcan-usb-fd")]
+    {
+        let bus: Arc<dyn CanBus> = Arc::new(if fd {
+            crate::pcan_usb_fd::PcanUsbFdBus::open_fd(spec)?
+        } else {
+            crate::pcan_usb_fd::PcanUsbFdBus::open(spec)?
+        });
+        Ok(bus)
     }
-    let native = std::env::var(PCAN_BACKEND_ENV)
-        .map(|v| v.eq_ignore_ascii_case("native"))
-        .unwrap_or(false);
-    (native && cfg!(any(target_os = "windows", target_os = "macos"))).then_some(channel)
+    #[cfg(not(feature = "pcan-usb-fd"))]
+    {
+        let _ = (spec, fd);
+        Err(crate::error::MotorError::Unsupported(
+            "peakusb: channels need motor_core built with the `pcan-usb-fd` feature".to_string(),
+        ))
+    }
 }
 
 pub fn open_can_bus(channel: &str) -> Result<Arc<dyn CanBus>> {
-    if let Some(spec) = native_pcan_channel(channel) {
-        #[cfg(feature = "pcan-usb-fd")]
-        {
-            let bus: Arc<dyn CanBus> = Arc::new(crate::pcan_usb_fd::PcanUsbFdBus::open(spec)?);
-            return Ok(bus);
-        }
-        #[cfg(not(feature = "pcan-usb-fd"))]
-        {
-            let _ = spec;
-            return Err(crate::error::MotorError::Unsupported(
-                "native PEAK uCAN backend not compiled in (enable motor_core feature `pcan-usb-fd`)"
-                    .to_string(),
-            ));
-        }
+    if let Some(spec) = channel.strip_prefix(PEAKUSB_PREFIX) {
+        return open_peakusb(spec, false);
     }
     #[cfg(target_os = "linux")]
     {
@@ -88,38 +83,20 @@ pub fn open_socketcan(channel: &str) -> Result<Arc<dyn CanBus>> {
     open_can_bus(channel)
 }
 
-/// CAN FD transport. Linux: SocketCAN FD. macOS/Windows with the
-/// `pcan-usb-fd` feature: the native PEAK uCAN backend in CAN FD mode (default
-/// 1 Mbit/s nominal / 5 Mbit/s data; `can0@1000000/5000000` to override), so
-/// callers like `Controller.from_socketcanfd("can0")` work unchanged.
 pub fn open_socketcanfd(channel: &str) -> Result<Arc<dyn CanBus>> {
+    if let Some(spec) = channel.strip_prefix(PEAKUSB_PREFIX) {
+        return open_peakusb(spec, true);
+    }
     #[cfg(target_os = "linux")]
     {
-        if let Some(spec) = channel.strip_prefix(PCAN_USB_FD_PREFIX) {
-            return open_native_pcan_fd(spec);
-        }
         let bus: Arc<dyn CanBus> = Arc::new(SocketCanFdBus::open(channel)?);
         Ok(bus)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        open_native_pcan_fd(channel.strip_prefix(PCAN_USB_FD_PREFIX).unwrap_or(channel))
-    }
-}
-
-fn open_native_pcan_fd(spec: &str) -> Result<Arc<dyn CanBus>> {
-    #[cfg(feature = "pcan-usb-fd")]
-    {
-        let bus: Arc<dyn CanBus> = Arc::new(crate::pcan_usb_fd::PcanUsbFdBus::open_fd(spec)?);
-        Ok(bus)
-    }
-    #[cfg(not(feature = "pcan-usb-fd"))]
-    {
-        let _ = spec;
+        let _ = channel;
         Err(crate::error::MotorError::InvalidArgument(
-            "socketcanfd transport needs Linux, or the native PEAK uCAN backend \
-             (build with motor_core feature `pcan-usb-fd`)"
-                .to_string(),
+            "socketcanfd transport is only available on Linux".to_string(),
         ))
     }
 }
@@ -198,5 +175,21 @@ pub fn open_transport(t: Transport, p: &TransportParams<'_>) -> Result<Arc<dyn C
             p.serial_port,
             p.serial_baud,
         )?)),
+    }
+}
+
+#[cfg(all(test, not(feature = "pcan-usb-fd")))]
+mod tests {
+    use super::*;
+    use crate::error::MotorError;
+
+    #[test]
+    fn peakusb_prefix_without_feature_is_unsupported() {
+        for result in [
+            open_can_bus("peakusb:can0@1000000"),
+            open_socketcanfd("peakusb:can1"),
+        ] {
+            assert!(matches!(result, Err(MotorError::Unsupported(_))));
+        }
     }
 }

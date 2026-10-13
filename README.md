@@ -621,27 +621,28 @@ Replace `motor-id` and `feedback-id` with your scan hits.
 
 ### 11. Optional: native backend (all channels, CAN FD, no PCBUSB)
 
-PCBUSB only reaches the first channel of multi-channel adapters (e.g. PCAN-USB Pro FD: `can1` fails with `PCAN_ERROR_ILLHW`) and has no CAN FD path here.
-The optional `pcan-usb-fd` feature talks to PEAK uCAN adapters (PCAN-USB FD / Pro FD / X6) directly over libusb: `can0` and `can1` reach both ports, in classic CAN or CAN FD (frames up to 8 bytes).
+PCBUSB only reaches the first channel of multi-channel adapters (e.g. PCAN-USB Pro FD: `can1` fails with `PCAN_ERROR_ILLHW`).
+The optional `pcan-usb-fd` feature talks to PEAK uCAN adapters (PCAN-USB FD / Pro FD / X6) directly over libusb. It is selected per channel with the `peakusb:` prefix; channels without it keep using PCBUSB.
+`peakusb:can0` and `peakusb:can1` reach both ports, in classic CAN or CAN FD (frames up to 8 bytes).
 
 ```bash
 # build with the native backend
 cargo build --release -p motor_cli -p motor_abi --features motor_core/pcan-usb-fd
 
-# CAN FD (1M/5M), e.g. Damiao motors with use_can_fd: same transport name as on Linux
-./target/release/motor_cli --vendor damiao --transport socketcanfd \
-  --channel can1 --mode scan --start-id 1 --end-id 8
-
-# classic CAN: select the backend with the `pcanfd:` prefix
+# classic CAN
 ./target/release/motor_cli \
-  --vendor damiao --channel pcanfd:can1@1000000 --mode scan --start-id 1 --end-id 16
+  --vendor damiao --channel peakusb:can1@1000000 --mode scan --start-id 1 --end-id 16
+
+# CAN FD: give a data bitrate (nominal/data)
+./target/release/motor_cli \
+  --vendor damiao --channel peakusb:can1@1000000/5000000 --mode scan --start-id 1 --end-id 8
 
 # Python SDK (Python >= 3.10): editable install picks up target/release/libmotor_abi.dylib
 pip install -e bindings/python
 ```
 
-In Python, `Controller.from_socketcanfd("can0")` uses CAN FD on macOS/Windows exactly as on Linux. For classic CAN use `Controller("pcanfd:can1")`, or set `MOTORBRIDGE_PCAN_BACKEND=native` (e.g. `os.environ["MOTORBRIDGE_PCAN_BACKEND"] = "native"` before creating controllers) to route plain `can0` / `can1`.
-CAN FD defaults: 1 Mbit/s nominal, 5 Mbit/s data, bit-rate switch on (`MOTOR_SOCKETCANFD_BRS=0` to disable); override rates with `can0@1000000/2000000`.
+In Python: `Controller("peakusb:can1")` for classic CAN, `Controller("peakusb:can1@1000000/5000000")` for CAN FD.
+The `socketcanfd` transport also accepts `peakusb:` channels (default 1 Mbit/s nominal, 5 Mbit/s data). CAN FD frames use bit-rate switch unless `MOTOR_SOCKETCANFD_BRS=0`.
 
 
 ## Linux CANable candleLight / gs_usb Quick Guide
