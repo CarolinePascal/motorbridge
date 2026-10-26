@@ -333,29 +333,73 @@ struct Device {
     cmd_lock: Mutex<()>,
     channels: [(Mutex<ChannelState>, Condvar); MAX_CHANNELS],
     running: AtomicBool,
+    closed: AtomicBool,
     rx_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Opening and closing channels holds this lock, so the last channel closing
+/// the adapter cannot race with a new channel reusing it.
 static DEVICE: OnceLock<Mutex<Weak<Device>>> = OnceLock::new();
 
+fn registry() -> std::sync::MutexGuard<'static, Weak<Device>> {
+    DEVICE
+        .get_or_init(|| Mutex::new(Weak::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 impl Device {
-    fn get_or_open() -> Result<Arc<Self>> {
-        let slot = DEVICE.get_or_init(|| Mutex::new(Weak::new()));
-        let mut slot = slot
-            .lock()
-            .map_err(|_| MotorError::Io("pcan-usb-fd registry lock poisoned".into()))?;
-        if let Some(dev) = slot.upgrade() {
-            return Ok(dev);
+    /// Open (or reuse) the adapter and mark `channel` open. Returns whether it
+    /// is the first open channel.
+    fn claim_channel(channel: u8) -> Result<(Arc<Self>, bool)> {
+        let mut slot = registry();
+        let dev = match slot.upgrade().filter(|d| d.running.load(Ordering::SeqCst)) {
+            Some(dev) => dev,
+            None => {
+                let dev = Arc::new(Self::open()?);
+                let worker = Arc::downgrade(&dev);
+                let handle = thread::Builder::new()
+                    .name("pcan-usb-fd-rx".into())
+                    .spawn(move || rx_loop(worker))
+                    .map_err(|e| MotorError::Io(format!("spawn rx thread: {e}")))?;
+                *dev.rx_thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+                *slot = Arc::downgrade(&dev);
+                dev
+            }
+        };
+        if channel >= dev.channel_count {
+            return Err(MotorError::InvalidArgument(format!(
+                "adapter has {} channel(s), can{channel} requested",
+                dev.channel_count
+            )));
         }
-        let dev = Arc::new(Self::open()?);
-        let worker = Arc::downgrade(&dev);
-        let handle = thread::Builder::new()
-            .name("pcan-usb-fd-rx".into())
-            .spawn(move || rx_loop(worker))
-            .map_err(|e| MotorError::Io(format!("spawn rx thread: {e}")))?;
-        *dev.rx_thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
-        *slot = Arc::downgrade(&dev);
-        Ok(dev)
+        let first = !dev.any_open();
+        let (state, _) = &dev.channels[usize::from(channel)];
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.open {
+            return Err(MotorError::InvalidArgument(format!(
+                "can{channel} is already open"
+            )));
+        }
+        s.open = true;
+        s.queue.clear();
+        drop(s);
+        Ok((dev, first))
+    }
+
+    /// Mark `channel` closed; the last one closes the adapter.
+    fn release_channel(&self, channel: u8) {
+        let _slot = registry();
+        {
+            let (state, cv) = &self.channels[usize::from(channel)];
+            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            s.open = false;
+            s.queue.clear();
+            cv.notify_all();
+        }
+        if !self.any_open() {
+            self.close();
+        }
     }
 
     fn open() -> Result<Self> {
@@ -424,6 +468,7 @@ impl Device {
             cmd_lock: Mutex::new(()),
             channels: Default::default(),
             running: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
             rx_thread: Mutex::new(None),
         })
     }
@@ -490,11 +535,24 @@ impl Device {
             .iter()
             .any(|(s, _)| s.lock().map(|s| s.open).unwrap_or(false))
     }
-}
 
-impl Drop for Device {
-    fn drop(&mut self) {
+    /// Stop the RX thread and release the interface, which re-attaches the
+    /// kernel driver (Linux `peak_usb`). Joining first keeps this on the
+    /// caller's thread: if the RX thread dropped the last reference instead,
+    /// a process exiting right after would skip it.
+    fn close(&self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.running.store(false, Ordering::SeqCst);
+        let rx = self
+            .rx_thread
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(rx) = rx.filter(|h| h.thread().id() != thread::current().id()) {
+            let _ = rx.join();
+        }
         let _ = self.send_cmds(&[cmd_options(0, false, OPTION_ERROR, FLTEXT_CALIBRATION)]);
         let _ = self.handle.write_control(
             REQ_TYPE_VENDOR_OTHER,
@@ -505,6 +563,12 @@ impl Drop for Device {
             USB_TIMEOUT,
         );
         let _ = self.handle.release_interface(0);
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -598,31 +662,9 @@ impl PcanUsbFdBus {
         } else {
             None
         };
-        let dev = Device::get_or_open()?;
-        if channel >= dev.channel_count {
-            return Err(MotorError::InvalidArgument(format!(
-                "adapter has {} channel(s), can{channel} requested",
-                dev.channel_count
-            )));
-        }
-        let first = !dev.any_open();
-        {
-            let (state, _) = &dev.channels[usize::from(channel)];
-            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-            if s.open {
-                return Err(MotorError::InvalidArgument(format!(
-                    "can{channel} is already open"
-                )));
-            }
-            s.open = true;
-            s.queue.clear();
-        }
+        let (dev, first) = Device::claim_channel(channel)?;
         if let Err(e) = dev.start_channel(channel, bt, dbt, first) {
-            dev.channels[usize::from(channel)]
-                .0
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .open = false;
+            dev.release_channel(channel);
             return Err(e);
         }
         Ok(Self {
@@ -714,11 +756,7 @@ impl CanBus for PcanUsbFdBus {
         let _ = self
             .dev
             .send_cmds(&[cmd(self.channel, CMD_RESET_MODE, &[])]);
-        let (state, cv) = &self.dev.channels[usize::from(self.channel)];
-        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-        s.open = false;
-        s.queue.clear();
-        cv.notify_all();
+        self.dev.release_channel(self.channel);
         Ok(())
     }
 }
