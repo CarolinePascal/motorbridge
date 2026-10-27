@@ -563,6 +563,9 @@ impl Device {
             USB_TIMEOUT,
         );
         let _ = self.handle.release_interface(0);
+        // Also rebinds `peak_usb` when a previous process was killed before releasing it.
+        #[cfg(target_os = "linux")]
+        let _ = self.handle.attach_kernel_driver(0);
     }
 }
 
